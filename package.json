@@ -1,0 +1,24 @@
+{
+  "name": "supabase-functions-nodejs",
+  "version": "1.0.0",
+  "description": "Notification services for EEO App",
+  "main": "index.js",
+  "scripts": {
+    "start:chatwoot": "node chatwoot-webhook.js",
+    "start:queue": "node process-queue.js",
+    "dev:chatwoot": "nodemon chatwoot-webhook.js",
+    "dev:queue": "nodemon process-queue.js"
+  },
+  "keywords": ["notifications", "supabase", "expo"],
+  "author": "EEO",
+  "license": "ISC",
+  "dependencies": {
+    "@supabase/supabase-js": "^2.87.1",
+    "dotenv": "^17.2.3",
+    "express": "^5.2.1",
+    "node-fetch": "^2.7.0"
+  },
+  "devDependencies": {
+    "nodemon": "^3.0.2"
+  }
+}
