@@ -1,158 +1,137 @@
-// chatwoot-webhook.js
-require('dotenv').config();
-const express = require('express');
+// Chatwoot Webhook Handler
+// Receives messages from Chatwoot and saves them to consultation_messages table
 const { createClient } = require('@supabase/supabase-js');
-const fetch = require('node-fetch');
 
-const app = express();
-app.use(express.json());
+const SUPABASE_URL = process.env.SUPABASE_URL;
+const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
 
-// Configurar Supabase client
-const supabase = createClient(
-  process.env.SUPABASE_URL,
-  process.env.SUPABASE_SERVICE_ROLE_KEY
-);
+const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
 
-console.log('🚀 Chatwoot Webhook Service Starting...');
-console.log('📍 Supabase URL:', process.env.SUPABASE_URL);
+/**
+ * Main handler for Chatwoot webhooks
+ */
+async function handler(req, res) {
+  // Only accept POST requests
+  if (req.method !== 'POST') {
+    return res.status(405).json({ error: 'Method not allowed' });
+  }
 
-// Health check
-app.get('/', (req, res) => {
-  res.json({ 
-    service: 'chatwoot-webhook',
-    status: 'healthy',
-    timestamp: new Date().toISOString()
-  });
-});
-
-// Webhook endpoint
-app.post('/chatwoot-webhook', async (req, res) => {
-  const startTime = Date.now();
-  
   try {
-    console.log('📨 Webhook received:', JSON.stringify(req.body, null, 2));
-
-    const { event, message_type, content, sender, contact } = req.body;
-
-    // Filtrar eventos no relevantes
-    if (event !== 'message_created' || message_type !== 'incoming') {
-      console.log('⏭️  Event ignored:', event, message_type);
-      return res.json({ ok: true, message: 'Event ignored' });
-    }
-
-    if (sender?.type !== 'User') {
-      console.log('⏭️  Message not from user');
-      return res.json({ ok: true, message: 'Not from user' });
-    }
-
-    const userId = contact?.identifier;
-    if (!userId) {
-      console.error('❌ Missing user identifier');
-      return res.status(400).json({ error: 'Missing user identifier' });
-    }
-
-    console.log('👤 Processing message for user:', userId);
-
-    // Obtener tokens del usuario
-    const { data: tokens, error: tokensError } = await supabase
-      .from('profile_push_tokens')
-      .select('expo_push_token, device_name')
-      .eq('user_id', userId)
-      .eq('is_active', true);
-
-    if (tokensError) {
-      console.error('❌ Error fetching tokens:', tokensError);
-      return res.status(500).json({ error: tokensError.message });
-    }
-
-    if (!tokens || tokens.length === 0) {
-      console.log('⚠️  No active tokens found for user');
-      return res.json({ ok: true, message: 'No active tokens' });
-    }
-
-    console.log(`📱 Found ${tokens.length} active token(s)`);
-
-    // Crear mensajes para Expo
-    const messages = tokens.map(t => ({
-      to: t.expo_push_token,
-      sound: 'default',
-      title: '💬 Nuevo mensaje',
-      body: content || 'Tienes un nuevo mensaje en el chat',
-      data: { 
-        type: 'chat_message', 
-        userId,
-        timestamp: new Date().toISOString()
-      },
-      priority: 'high',
-      channelId: 'chat'
-    }));
-
-    // Enviar notificaciones a Expo
-    console.log('📤 Sending push notifications to Expo...');
-    const response = await fetch('https://exp.host/--/api/v2/push/send', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Accept': 'application/json',
-        'Accept-Encoding': 'gzip, deflate'
-      },
-      body: JSON.stringify(messages)
+    const webhook = req.body;
+    
+    console.log('📥 Received Chatwoot webhook:', {
+      event: webhook.event,
+      conversation_id: webhook.conversation?.id,
+      message_id: webhook.message?.id
     });
 
-    if (!response.ok) {
-      const errorText = await response.text();
-      console.error('❌ Expo API error:', response.status, errorText);
-      return res.status(500).json({ error: 'Expo API error', details: errorText });
+    // Only process message creation events
+    if (webhook.event !== 'message_created') {
+      console.log('⏭️  Skipping non-message event:', webhook.event);
+      return res.status(200).json({ 
+        success: true, 
+        message: 'Event ignored' 
+      });
     }
 
-    const result = await response.json();
-    console.log('✅ Push sent successfully:', result);
+    const message = webhook.message;
+    const conversation = webhook.conversation;
 
-    // Detectar y limpiar tokens inválidos
-    if (result.data) {
-      for (let i = 0; i < result.data.length; i++) {
-        const ticket = result.data[i];
-        if (ticket.status === 'error' && 
-            ticket.details?.error === 'DeviceNotRegistered') {
-          const invalidToken = messages[i].to;
-          console.log('🗑️  Deactivating invalid token:', invalidToken);
-          
-          await supabase
-            .from('profile_push_tokens')
-            .update({ is_active: false })
-            .eq('expo_push_token', invalidToken);
+    // Skip if message is outgoing (sent by us)
+    if (message.message_type === 'outgoing') {
+      console.log('⏭️  Skipping outgoing message');
+      return res.status(200).json({ 
+        success: true, 
+        message: 'Outgoing message ignored' 
+      });
+    }
+
+    // Find consultation by Chatwoot conversation ID
+    const { data: consultation, error: consultationError } = await supabase
+      .from('consultations')
+      .select('id, user_id, consultant_id')
+      .eq('chatwoot_conversation_id', conversation.id.toString())
+      .single();
+
+    if (consultationError || !consultation) {
+      console.error('❌ Consultation not found for conversation:', conversation.id);
+      return res.status(404).json({ 
+        error: 'Consultation not found',
+        conversation_id: conversation.id 
+      });
+    }
+
+    console.log('✅ Found consultation:', consultation.id);
+
+    // Determine message sender
+    // If message is from contact (user), use user_id
+    // If message is from agent (consultant), use consultant_id or system
+    let senderId = consultation.user_id; // Default to user
+    let messageType = 'user';
+
+    // Check if message is from an agent
+    if (message.sender && message.sender.type === 'agent') {
+      // If consultant is assigned, use consultant_id, otherwise mark as system
+      if (consultation.consultant_id) {
+        senderId = consultation.consultant_id;
+        messageType = 'consultant';
+      } else {
+        // Use the first admin/author as fallback
+        const { data: admin } = await supabase
+          .from('profiles')
+          .select('id')
+          .in('role', ['admin', 'author'])
+          .limit(1)
+          .single();
+        
+        if (admin) {
+          senderId = admin.id;
+          messageType = 'consultant';
+        } else {
+          senderId = consultation.user_id;
+          messageType = 'system';
         }
       }
     }
 
-    const duration = Date.now() - startTime;
-    console.log(`⏱️  Request completed in ${duration}ms`);
+    // Save message to consultation_messages
+    const { data: savedMessage, error: messageError } = await supabase
+      .from('consultation_messages')
+      .insert({
+        consultation_id: consultation.id,
+        user_id: senderId,
+        content: message.content,
+        message_type: messageType,
+        is_read: false
+      })
+      .select()
+      .single();
 
-    res.json({ 
-      ok: true, 
-      sent: tokens.length,
-      duration_ms: duration
+    if (messageError) {
+      console.error('❌ Error saving message:', messageError);
+      return res.status(500).json({ 
+        error: 'Failed to save message',
+        details: messageError.message 
+      });
+    }
+
+    console.log('✅ Message saved:', savedMessage.id);
+
+    // Update consultation updated_at timestamp (triggers automatically via trigger)
+    
+    return res.status(200).json({
+      success: true,
+      message_id: savedMessage.id,
+      consultation_id: consultation.id
     });
 
   } catch (error) {
-    const duration = Date.now() - startTime;
-    console.error('💥 Fatal error:', error);
-    res.status(500).json({ 
-      error: error.message,
-      duration_ms: duration
+    console.error('❌ Webhook handler error:', error);
+    return res.status(500).json({ 
+      error: 'Internal server error',
+      details: error.message 
     });
   }
-});
+}
 
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, '0.0.0.0', () => {
-  console.log(`✅ Chatwoot Webhook Service running on port ${PORT}`);
-  console.log(`🔗 Health check: http://localhost:${PORT}/`);
-  console.log(`🔗 Webhook URL: http://localhost:${PORT}/chatwoot-webhook`);
-});
-
-// Graceful shutdown
-process.on('SIGTERM', () => {
-  console.log('👋 SIGTERM received, shutting down gracefully...');
-  process.exit(0);
-});
+module.exports = handler;
